@@ -108,85 +108,96 @@
 #define TIMEOUT (-1)
 #define PROTOCOL_ERROR (-1)
 
+#define DHT_OK 0
+#define DHT_CHECKSUM_ERROR -1
+#define DHT_TIMEOUT_ERROR -2
+float humidity = 0.;
+float temperature = 0.;
+unsigned long lastReadTime;
 
-static const char *const dht_bad_read         = "\x8"  "bad_read";
+static const char *const dht_bad_read = "\x8"
+                                        "bad_read";
 //                                                      123456789ABCDEF01
-
-
-static inline void init_hanshake(avm_int_t pin)
-{
-    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
-    gpio_set_level(pin, 0);
-    ets_delay_us(HANDSHAKE_SEND_LOW_US);
-    gpio_set_level(pin, 1);
-    gpio_set_direction(pin, GPIO_MODE_INPUT);
-}
-
-static inline int wait_while(avm_int_t pin, unsigned value, int max_wait)
-{
-    register int i = 0;
-    for (;  gpio_get_level(pin) == value;  ++i) {
-        if (max_wait < i) {
-            return TIMEOUT;
-        }
-        ets_delay_us(1);
-    }
-    return i;
-}
-
-static inline int handshake(avm_int_t pin)
-{
-    init_hanshake(pin);
-
-    if (wait_while(pin, 1, MAX_WAIT_US) == TIMEOUT) {
-        TRACE("Timed out waiting to initialze handshake\n");
-        return PROTOCOL_ERROR;
-    }
-    if (wait_while(pin, 0, HANDSHAKE_RECV_LOW_US) == TIMEOUT) {
-        TRACE("Timed out waiting to recieve handshake low signal\n");
-        return PROTOCOL_ERROR;
-    }
-    if (wait_while(pin, 1, HANDSHAKE_RECV_HIGH_US) == TIMEOUT) {
-        TRACE("Timed out waiting to recieve handshake high signal\n");
-        return PROTOCOL_ERROR;
-    }
-
-    return 0;
-}
-
-
+// this banging code https://github.com/beegee-tokyo/DHTesp/blob/master/DHTesp.cpp works on the wokwi sim.
+// for reasons, not to be investigated
+//
 static int read_into(avm_int_t pin, uint8_t *buf)
 {
-    if (handshake(pin) == PROTOCOL_ERROR) {
-        TRACE("Hanshake failed on pin %d\n", pin);
-        return PROTOCOL_ERROR;
+    int64_t startTime = esp_timer_get_time();
+    if (lastReadTime && (unsigned long) (startTime - lastReadTime) < 2000000) {
+        printf("Too fast\n");
+        return DHT_CHECKSUM_ERROR;
     }
+    lastReadTime = startTime;
 
-    // read 40 bits into buf
-    for (unsigned i = 0;  i < 40;  ++i) {
-        if (wait_while(pin, 0, DATA_RECV_LOW_US) == TIMEOUT) {
-            TRACE("Timed out waiting to recieve data low signal\n");
-            return PROTOCOL_ERROR;
+    uint16_t rawHumidity = 0;
+    uint16_t rawTemperature = 0;
+    uint16_t data = 0;
+
+    // == Send start signal to DHT sensor ===========
+
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    // pull down for 3 ms for a smooth and nice wake up
+    gpio_set_level(pin, 0);
+    esp_rom_delay_us(2000);
+    // pull up for 25 us for a gentile asking for data
+    gpio_set_direction(pin, GPIO_MODE_INPUT); // change to input mode
+    gpio_set_level(pin, 1);
+    esp_rom_delay_us(25);
+
+    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    // go critical as timings will be very sensitive
+    portENTER_CRITICAL(&mux);
+
+    for (int8_t i = -3; i < 2 * 40; i++) {
+        uint8_t age = 0;
+        startTime = esp_timer_get_time();
+        do {
+            age = (unsigned long) (esp_timer_get_time() - startTime);
+            if (age > 90) {
+                portEXIT_CRITICAL(&mux);
+                return DHT_TIMEOUT_ERROR;
+            }
+        } while (gpio_get_level(pin) == (i & 1) ? 1 : 0);
+
+        if (i >= 0 && (i & 1)) {
+            // Now we are being fed our 40 bits
+            data <<= 1;
+
+            // A zero max 30 usecs, a one at least 68 usecs.
+            if (age > 30) {
+                data |= 1; // we got a one
+            }
         }
-        int try_one = wait_while(pin, 1, DATA_RECV_HIGH_ONE_US);
-        switch (try_one) {
-            case TIMEOUT:
-                // pin was high for at least DATA_RECV_HIGH_ONE_US; it has to be a 1
-                buf[i / 8] |= (1 << (7 - (i % 8)));
+
+        switch (i) {
+            case 31:
+                rawHumidity = data;
                 break;
-            default:
-                // it could be a 0, if the pin was high for less than DATA_RECV_HIGH_ZERO_US
-                // otherwise, it's a 1
-                if (DATA_RECV_HIGH_ZERO_US < try_one) {
-                    buf[i / 8] |= (1 << (7 - (i % 8)));
-                }
+            case 63:
+                rawTemperature = data;
+                data = 0;
                 break;
         }
     }
+    portEXIT_CRITICAL(&mux);
 
-    return 0;
+    if ((uint8_t) ((uint16_t) (rawHumidity + (rawHumidity >> 8) + rawTemperature + (rawTemperature >> 8))) != data) {
+        return DHT_CHECKSUM_ERROR;
+    }
+    humidity = rawHumidity * 0.1;
+    if (rawTemperature & 0x8000) {
+        rawTemperature = -(int16_t) (rawTemperature & 0x7FFF);
+    }
+    temperature = ((int16_t) rawTemperature) * 0.1;
+
+    buf[0] = (uint8_t) ((rawHumidity >> 8) & 0xFF);
+    buf[1] = (uint8_t) (rawHumidity & 0xFF);
+    buf[3] = (uint8_t) (rawTemperature & 0xFF);
+    buf[2] = (uint8_t) ((rawTemperature >> 8) & 0xFF);
+    buf[4] = data;
+    return DHT_OK;
 }
-
 
 static term nif_dht_read(Context *ctx, int argc, term argv[])
 {
